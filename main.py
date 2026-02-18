@@ -4,7 +4,6 @@ import fitz
 import httpx
 import os
 import uvicorn
-import itertools
 
 app = FastAPI()
 
@@ -15,17 +14,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ⚠️ 5 Gmail hesabını buraya yaz (MyMemory'ye kayıtlı olmalı)
-EMAILS = [
-    "toprakayazsahan@gmail.com",
-    "sahanyilmaz285@gmail.com",
-    "sahan2646@gmail.com",
-    "yilmazsahan235@gmail.com",
-    "yilmaxsahan@gmail.com",
-]
+# Railway'de environment variable olarak ekleyeceğiz
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "")
 
-# Her istek farklı e-posta kullanır (round-robin)
-email_cycle = itertools.cycle(EMAILS)
+# DeepL Free API endpoint (key sonu :fx ise free demek)
+DEEPL_URL = "https://api-free.deepl.com/v2/translate"
+
+# DeepL dil kodları (bazıları MyMemory'den farklı)
+LANG_MAP = {
+    "tr": "TR",
+    "en": "EN-US",
+    "de": "DE",
+    "fr": "FR",
+    "es": "ES",
+    "it": "IT",
+    "pt": "PT-PT",
+    "ru": "RU",
+    "ar": "AR",
+    "zh": "ZH",
+    "ja": "JA",
+    "ko": "KO",
+    "nl": "NL",
+    "pl": "PL",
+    "sv": "SV",
+}
 
 @app.get("/")
 def root():
@@ -56,43 +68,52 @@ async def extract_text(file: UploadFile = File(...)):
 async def translate(body: dict):
     text = body.get("text", "")
     target_lang = body.get("target_lang", "tr")
-    source_lang = body.get("source_lang", "autodetect")
 
     if not text:
         raise HTTPException(status_code=400, detail="Metin boş olamaz")
 
-    chunks = split_text(text)
+    if not DEEPL_API_KEY:
+        raise HTTPException(status_code=500, detail="DEEPL_API_KEY tanımlı değil")
+
+    # DeepL dil koduna çevir
+    deepl_target = LANG_MAP.get(target_lang, target_lang.upper())
+
+    # DeepL tek istekte büyük metin kabul eder (max 128KB)
+    # Yine de güvenlik için 3000 karakterlik parçalara bölelim
+    chunks = split_text(text, max_length=3000)
     translated_chunks = []
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         for chunk in chunks:
-            # Her chunk için sıradaki e-postayı kullan
-            email = next(email_cycle)
-
-            response = await client.get(
-                "https://api.mymemory.translated.net/get",
-                params={
-                    "q": chunk,
-                    "langpair": f"{source_lang}|{target_lang}",
-                    "de": email,
+            response = await client.post(
+                DEEPL_URL,
+                headers={
+                    "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": [chunk],
+                    "target_lang": deepl_target,
+                    "source_lang": None,  # otomatik algıla
                 }
             )
-            data = response.json()
 
-            if data.get("responseStatus") == 200:
-                translated_chunks.append(data["responseData"]["translatedText"])
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Çeviri hatası: {data.get('responseDetails')}"
-                )
+            if response.status_code == 456:
+                raise HTTPException(status_code=429, detail="DeepL aylık karakter limiti doldu")
+            elif response.status_code == 403:
+                raise HTTPException(status_code=403, detail="DeepL API key geçersiz")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"DeepL hatası: {response.text}")
+
+            data = response.json()
+            translated_chunks.append(data["translations"][0]["text"])
 
     return {
         "success": True,
         "translated_text": "\n".join(translated_chunks)
     }
 
-def split_text(text: str, max_length: int = 450) -> list:
+def split_text(text: str, max_length: int = 3000) -> list:
     import re
     sentences = re.split(r'(?<=[.!?\n])\s+', text)
     chunks = []
